@@ -1,0 +1,85 @@
+{
+    "$schema": "https://biomejs.dev/schemas/2.6.5/schema.json",
+    "vcs": {
+        "clientKind": "git",
+        "enabled": true,
+        "root": ".",
+        "useIgnoreFile": true
+    },
+    "files": {
+        "ignoreUnknown": false,
+        // `dist/` is generated output and `package-lock.json` belongs to npm: both are
+        // checked in, so neither may be rewritten by the formatter.
+        "includes": [
+            "**",
+            "!dist",
+            "!package-lock.json"
+        ]
+    },
+    "formatter": {
+        "indentStyle": "space",
+        "indentWidth": 4,
+        "lineWidth": 100,
+        "attributePosition": "multiline",
+        "expand": "always"
+    },
+    "assist": {
+        "actions": {
+            "source": {
+                "organizeImports": "on",
+                "useSortedProperties": "on"
+            }
+        }
+    },
+    "linter": {
+        "rules": {
+            "preset": "recommended",
+            "complexity": {
+                "useLiteralKeys": "off"
+            },
+            "suspicious": {
+                "noConstEnum": "off",
+                // `cssString` must match control characters to keep generated CSS valid.
+                "noControlCharactersInRegex": "off"
+            }
+        }
+    },
+    "javascript": {
+        "parser": {
+            "jsxEverywhere": false
+        },
+        "formatter": {
+            "enabled": true,
+            "quoteStyle": "double",
+            "trailingCommas": "all",
+            "semicolons": "always",
+            "arrowParentheses": "always"
+        },
+        "linter": {
+            "enabled": true
+        },
+        "assist": {
+            "enabled": true
+        }
+    },
+    "json": {
+        "formatter": {
+            "enabled": true
+        },
+        "linter": {
+            "enabled": true
+        },
+        "assist": {
+            "enabled": true
+        }
+    },
+    "markdown": {
+        "parser": {
+            "cjkFriendlyEmphasis": true
+        },
+        "formatter": {
+            "formatEmbeds": false,
+            "proseWrap": "preserve"
+        }
+    }
+}

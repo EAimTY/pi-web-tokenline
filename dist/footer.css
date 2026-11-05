@@ -1,0 +1,30 @@
+/*
+ * This is intentionally scoped to PI WEB's <status-bar> shadow root.
+ * Its internal .bar and span structure is not a stable plugin contract.
+ * Unset the custom properties to restore PI WEB's native footer.
+ */
+:host(status-bar) .bar > span {
+    display: var(--pi-tokenline-native-display, revert);
+}
+
+:host(status-bar) .bar::after {
+    min-width: 0;
+    max-width: 100%;
+    overflow: visible;
+    font-family: var(--pi-mono, ui-monospace, SFMono-Regular, Menlo, Consolas, monospace);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    line-height: 1.35;
+    color: var(--pi-muted, currentColor);
+    text-align: right;
+    letter-spacing: -0.01em;
+    overflow-wrap: anywhere;
+    white-space: normal;
+    content: var(--pi-tokenline-content, none);
+}
+
+@media (max-width: 600px) {
+    :host(status-bar) .bar::after {
+        font-size: 10px;
+    }
+}

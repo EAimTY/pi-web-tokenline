@@ -1,0 +1,13 @@
+# macOS
+.DS_Store
+
+# Node
+/node_modules/
+
+# npm pack output
+*.tgz
+
+# Local environment
+.env
+.env.*
+coverage/

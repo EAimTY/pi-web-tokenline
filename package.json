@@ -1,0 +1,59 @@
+{
+    "name": "pi-web-tokenline",
+    "version": "0.1.0",
+    "type": "module",
+    "description": "Minimal live TPS and token usage status line for @jmfederico/pi-web",
+    "license": "MIT",
+    "keywords": [
+        "pi-package",
+        "pi-web-plugin",
+        "pi-web.dev-plugin",
+        "pi-web",
+        "tokenline",
+        "tokens-per-second",
+        "tps",
+        "context",
+        "cache"
+    ],
+    "engines": {
+        "node": ">=22"
+    },
+    "files": [
+        "dist"
+    ],
+    "publishConfig": {
+        "access": "public"
+    },
+    "piWeb": {
+        "plugins": [
+            {
+                "id": "tokenline",
+                "browserRoot": "dist",
+                "module": "dist/pi-web-plugin.js"
+            }
+        ]
+    },
+    "scripts": {
+        "build": "vite build --config vite.config.ts",
+        "check": "biome check && tsc --noEmit",
+        "fix": "biome check --write --unsafe && tsc --noEmit",
+        "test": "vitest run",
+        "verify:dist": "npm run build && test -z \"$(git status --porcelain -- dist)\"",
+        "prepack": "npm run build"
+    },
+    "devDependencies": {
+        "@biomejs/biome": "^2.6.5",
+        "@types/node": "^26.6.6",
+        "typescript": "^7.0.2",
+        "vite": "^8.3.6",
+        "vitest": "^5.1.0"
+    },
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/EAimTY/pi-web-tokenline.git"
+    },
+    "homepage": "https://github.com/EAimTY/pi-web-tokenline#readme",
+    "bugs": {
+        "url": "https://github.com/EAimTY/pi-web-tokenline/issues"
+    }
+}
