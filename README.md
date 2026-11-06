@@ -8,8 +8,10 @@ A minimal, live token telemetry footer for **[@jmfederico/pi-web](https://github
 > Community plugin, not affiliated with the Pi Web maintainers. The footer styling and session endpoints are internal Pi Web implementation details and may change between Pi Web releases.
 
 ```text
-TPS 42.5 tok/s  ·  Ctx 68.5K/272K  ·  In 2.4K  ·  Out 17.2K  ·  Cache R 140K  ·  W 2.3K
+TPS 48 tok/s  ·  Ctx 68.5K/272K  ·  In 2.4K  ·  Out 17.2K  ·  Cache R 140K  ·  W 2.3K
 ```
+
+`TPS ~67` is a live estimate; `TPS 48` is an exact decode final; `TPS 41 tok/s avg` is an exact end-to-end final for a message whose tool-call tokens could not be observed while streaming.
 
 ## Install
 
@@ -39,16 +41,20 @@ You can also remove the now-unused `tokenSpeed` section from `~/.pi/agent/settin
 
 ## Metrics
 
-| Display     | Meaning                                                                            | Source                                                           |
-| ----------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------- |
-| **TPS**     | Approximate generated tokens per second, measured over a 2.5-second sliding window | Live assistant text + thinking deltas                            |
-| **Ctx**     | Best available current context occupancy / model context window                    | Pi Web's compaction-aware session status; recent completed usage |
-| **In**      | Cumulative uncached input tokens for the session                                   | Pi SDK session stats                                             |
-| **Out**     | Cumulative output tokens; estimated pending output while streaming                 | Pi SDK session stats + live delta estimate                       |
-| **Cache R** | Cumulative cache-read tokens                                                       | Pi SDK session stats                                             |
-| **W**       | Cumulative cache-write tokens                                                      | Pi SDK session stats                                             |
+| Display     | Meaning                                                                 | Source                                                           |
+| ----------- | ----------------------------------------------------------------------- | ---------------------------------------------------------------- |
+| **TPS**     | Live estimated decode TPS; exact per-message decode or end-to-end final | Live assistant text + thinking deltas; provider usage at the end |
+| **Ctx**     | Best available current context occupancy / model context window         | Pi Web's compaction-aware session status; recent completed usage |
+| **In**      | Cumulative uncached input tokens for the session                        | Pi SDK session stats                                             |
+| **Out**     | Cumulative output tokens; estimated pending output while streaming      | Pi SDK session stats + live delta estimate                       |
+| **Cache R** | Cumulative cache-read tokens                                            | Pi SDK session stats                                             |
+| **W**       | Cumulative cache-write tokens                                           | Pi SDK session stats                                             |
 
-**TPS is an estimate, not provider-reported throughput.** Provider chunking, thinking blocks, CJK text, and buffering affect it. Pi Web's browser event stream does not expose token-by-token tool-call argument generation, so TPS may read `0` during those periods. During a model stall, TPS decays to zero; while idle, it shows `--`.
+**TPS has live and final states.** While text streams, `TPS ~67` is an estimate over a 3-second trailing window. The first chunk only opens the window because its generation time happened before the browser could observe it; later intervals are capped at twice the recent pace, and the first second has no published rate. This keeps buffered chunks from printing four-digit values. After three silent seconds the live value reads `0`; a stream that ends shows its final value.
+
+When an assistant message ends, the footer replaces the live estimate with an exact per-message reading. A message with no tool call gets **exact decode TPS** (`output ÷ first token → end`). A message with tool calls, reasoning that never streamed, or a buffered response gets **exact end-to-end TPS** (`output ÷ assistant message start → end`) and is labeled `avg`. Pi Web's browser event stream does not expose tool-call argument deltas, so live TPS may read `0` while those arguments are generated; the `avg` value is the safe final reading.
+
+**The estimate is calibrated per model.** After a fully observable message, the character estimate is adjusted toward the provider's output count within a conservative range. Tool-call messages, hidden reasoning, and end-to-end fallback messages never train the calibration, because their delta windows do not cover the same output the provider counted. `Out` still snaps to provider usage at the end of each message.
 
 **Context is not cumulative session input.** It is the best available estimate of the context sent to the model. Immediately after compaction, Pi may legitimately report an unknown context length, displayed as `Ctx --/272K`, until a new response is available. Session token counters reflect Pi's own usage semantics, including any branching and cache accounting.
 

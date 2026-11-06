@@ -1,12 +1,16 @@
 // Vite emits this asset import as an `import.meta.url`-relative absolute URL; the browser build
 // is the only place the value is read, and `vite.config.ts` keeps `base` relative for it.
 import footerStylesheetUrl from "./footer.css?url";
-import type { SessionEvent, SessionStatus } from "./host-contract.ts";
+import type { MessageEnd, SessionEvent, SessionStatus } from "./host-contract.ts";
 import { parseSessionEvent, parseSessionStatus } from "./host-contract.ts";
 import {
     approximateTokens,
+    computeFinalReading,
     cssString,
     formatFooter,
+    IDLE_RATE_MS,
+    nextCalibration,
+    type RateReading,
     RateWindow,
     reportedContext,
 } from "./metrics.ts";
@@ -20,8 +24,22 @@ import type {
 const CSS_VALUE = "--pi-tokenline-content";
 const CSS_NATIVE_DISPLAY = "--pi-tokenline-native-display";
 const UPDATE_INTERVAL_MS = 180;
+const TICK_INTERVAL_MS = 250;
 const STATUS_REFRESH_DELAY_MS = 100;
-const STALE_TPS_MS = 3000;
+const MAX_CALIBRATION_MODELS = 16;
+const FRAME_DECODER = new TextDecoder();
+
+/**
+ * Text of one event frame, or `null` for a payload this transport cannot carry. The host delivers
+ * JSON text as binary frames (see `host-contract.ts`), so decoding stays synchronous here to keep
+ * frames in wire order.
+ */
+function frameText(data: unknown): string | null {
+    if (typeof data === "string") return data;
+    if (data instanceof ArrayBuffer) return FRAME_DECODER.decode(data);
+    if (ArrayBuffer.isView(data)) return FRAME_DECODER.decode(data);
+    return null;
+}
 
 /** Resolves PI WEB's own application prefix, including reverse-proxy subpaths. */
 function appBase(moduleUrl = import.meta.url, fallback = document.baseURI): URL {
@@ -67,17 +85,26 @@ class TokenlineFooter {
     private readonly selection: PluginSelectionService | undefined;
     private readonly base: URL;
     private readonly rate = new RateWindow();
+    private readonly calibrationByModel = new Map<string, number>();
     private version = 0;
     private key = "";
     private active = false;
     private disposed = false;
     private status: SessionStatus | null = null;
     private statusRevision = 0;
+    private statusFingerprint = "";
     private lastContext: number | null = null;
     private streaming = false;
+    private assistantStartAt: number | null = null;
+    private firstDeltaAt: number | null = null;
+    private lastDeltaAt: number | null = null;
+    private thinkingCharacters = 0;
+    private rawEstimate = 0;
+    private messageCalibration = 1;
+    private messageModelKey: string | null = null;
+    private lastFinal: RateReading | null = null;
     private liveBaseline = 0;
     private pendingOutput = 0;
-    private lastDeltaAt = 0;
     private lastPaintAt = 0;
     private retryMs = 500;
     private lastError = "";
@@ -100,7 +127,7 @@ class TokenlineFooter {
         this.select(this.selection?.getSnapshot());
         this.tickTimer = setInterval(() => {
             if (this.active && this.streaming) this.paint();
-        }, 500);
+        }, TICK_INTERVAL_MS);
     }
 
     private select(selection: PluginSelectionSnapshot | undefined): void {
@@ -112,11 +139,21 @@ class TokenlineFooter {
         this.version += 1;
         this.status = null;
         this.statusRevision = 0;
+        this.statusFingerprint = "";
         this.lastContext = null;
         this.rate.clear();
         this.streaming = false;
+        this.assistantStartAt = null;
+        this.firstDeltaAt = null;
+        this.lastDeltaAt = null;
+        this.thinkingCharacters = 0;
+        this.rawEstimate = 0;
+        this.messageCalibration = 1;
+        this.messageModelKey = null;
+        this.lastFinal = null;
         this.liveBaseline = 0;
         this.pendingOutput = 0;
+        this.lastPaintAt = 0;
         this.active = false;
         this.urls = undefined;
         this.restoreNative();
@@ -166,19 +203,51 @@ class TokenlineFooter {
     }
 
     private receiveStatus(status: SessionStatus): void {
+        const now = performance.now();
+        const fingerprint = JSON.stringify([
+            status.tokens.totalTokens,
+            status.tokens.input,
+            status.tokens.output,
+            status.tokens.cacheRead,
+            status.tokens.cacheWrite,
+            status.contextUsage?.tokens ?? "none",
+            status.contextUsage?.contextWindow ?? 0,
+            status.isStreaming,
+            status.modelKey,
+        ]);
+        const changed = fingerprint !== this.statusFingerprint;
         this.status = status;
         this.statusRevision += 1;
+        this.statusFingerprint = fingerprint;
         if (this.pendingOutput <= (status.tokens.output ?? 0)) this.pendingOutput = 0;
-        if (status.contextUsage !== null) this.lastContext = status.contextUsage.tokens;
-        if (!status.isStreaming && !this.streaming) this.rate.clear();
+        // A status snapshot can close a stream whose end event never arrived. Keep the freshest
+        // measurable live value as an estimate rather than leaving a stale window frozen.
+        if (
+            !status.isStreaming &&
+            this.streaming &&
+            this.lastDeltaAt !== null &&
+            now - this.lastDeltaAt > IDLE_RATE_MS
+        ) {
+            const lastLive = this.rate.value(now);
+            if (this.lastFinal === null && lastLive !== null && lastLive > 0) {
+                this.lastFinal = {
+                    kind: "finalEstimate",
+                    value: lastLive,
+                };
+            }
+            this.streaming = false;
+            this.rate.clear();
+        }
         this.active = true;
-        this.paint(true);
+        this.paint(changed);
     }
 
     private connect(version: number): void {
         const urls = this.urls;
         if (this.disposed || this.version !== version || urls === undefined) return;
         const socket = new WebSocket(urls.eventsUrl);
+        // Binary frames decode synchronously; see `frameText`.
+        socket.binaryType = "arraybuffer";
         this.socket = socket;
         socket.onopen = () => {
             if (this.socket !== socket || this.version !== version) return;
@@ -188,9 +257,13 @@ class TokenlineFooter {
         };
         socket.onmessage = (event) => {
             if (this.socket !== socket || this.version !== version) return;
-            if (typeof event.data !== "string") return;
+            const frame = frameText(event.data);
+            if (frame === null) {
+                this.logOnce("Unsupported session event frame", typeof event.data);
+                return;
+            }
             try {
-                const sessionEvent = parseSessionEvent(JSON.parse(event.data));
+                const sessionEvent = parseSessionEvent(JSON.parse(frame));
                 if (sessionEvent !== null) this.consume(sessionEvent);
             } catch (error) {
                 this.logOnce("Unrecognized session event", error);
@@ -213,56 +286,162 @@ class TokenlineFooter {
             case "status.update":
                 this.receiveStatus(event.status);
                 break;
+            case "agent.start":
+                this.streaming = false;
+                this.rate.clear();
+                this.lastFinal = null;
+                this.assistantStartAt = null;
+                this.firstDeltaAt = null;
+                this.lastDeltaAt = null;
+                this.thinkingCharacters = 0;
+                this.rawEstimate = 0;
+                this.messageModelKey = null;
+                this.paint(true);
+                break;
             case "assistant.start":
                 this.streaming = true;
-                this.rate.start(now);
-                this.lastDeltaAt = 0;
+                this.rate.clear();
+                this.lastFinal = null;
+                this.assistantStartAt = now;
+                this.firstDeltaAt = null;
+                this.lastDeltaAt = null;
+                this.thinkingCharacters = 0;
+                this.rawEstimate = 0;
+                this.messageCalibration = 1;
+                this.messageModelKey = null;
                 this.liveBaseline = Math.max(this.status?.tokens.output ?? 0, this.pendingOutput);
                 this.paint(true);
                 break;
             case "assistant.delta":
-            case "assistant.thinking.delta":
+            case "assistant.thinking.delta": {
                 if (!this.streaming) {
                     this.streaming = true;
-                    this.rate.start(now);
+                    this.rate.clear();
+                    this.lastFinal = null;
+                    this.assistantStartAt = null;
+                    this.firstDeltaAt = null;
+                    this.lastDeltaAt = null;
+                    this.thinkingCharacters = 0;
+                    this.rawEstimate = 0;
+                    this.messageCalibration = 1;
+                    this.messageModelKey = null;
                     this.liveBaseline = Math.max(
                         this.status?.tokens.output ?? 0,
                         this.pendingOutput,
                     );
                 }
-                this.rate.add(approximateTokens(event.text), now);
+                if (this.firstDeltaAt === null) {
+                    this.firstDeltaAt = now;
+                    this.messageModelKey = this.status?.modelKey ?? null;
+                    this.messageCalibration = this.calibrationFor(this.messageModelKey);
+                }
+                const raw = approximateTokens(event.text);
+                this.rawEstimate += raw;
+                if (event.type === "assistant.thinking.delta") {
+                    this.thinkingCharacters += event.text.length;
+                }
+                this.rate.add(raw * this.messageCalibration, now);
                 this.lastDeltaAt = now;
                 this.paint();
                 break;
+            }
             case "message.end":
                 if (event.message.role === "assistant") {
-                    this.streaming = false;
-                    const fromMessage = reportedContext(event.message.usage);
-                    if (fromMessage !== null) this.lastContext = fromMessage;
-                    this.pendingOutput = Math.max(
-                        this.pendingOutput,
-                        this.liveBaseline + (event.message.usage.output ?? this.rate.total),
-                    );
-                    this.paint(true);
-                    this.scheduleStatusRefresh(this.version);
+                    this.finishMessage(event.message, now);
                 }
                 break;
-            case "agent.end":
+            case "agent.end": {
+                if (this.streaming) {
+                    const lastLive = this.rate.value(now);
+                    if (this.lastFinal === null && lastLive !== null && lastLive > 0) {
+                        this.lastFinal = {
+                            kind: "finalEstimate",
+                            value: lastLive,
+                        };
+                    }
+                }
                 this.streaming = false;
                 this.rate.clear();
                 this.paint(true);
                 this.scheduleStatusRefresh(this.version);
                 break;
+            }
             case "session.tree.changed":
                 this.streaming = false;
                 this.rate.clear();
+                this.lastFinal = null;
+                this.assistantStartAt = null;
+                this.firstDeltaAt = null;
+                this.lastDeltaAt = null;
+                this.thinkingCharacters = 0;
+                this.rawEstimate = 0;
+                this.messageModelKey = null;
                 this.pendingOutput = 0;
                 this.lastContext = null;
+                this.statusFingerprint = "";
                 // Don't show stale branch totals during navigation.
                 this.restoreNative();
                 this.active = false;
                 this.scheduleStatusRefresh(this.version);
                 break;
+        }
+    }
+
+    /**
+     * Replace the live estimate with the exact per-message reading. A tool-call message's usage
+     * includes argument tokens the browser never streamed, so the final-rate helper falls back to
+     * whole-message time and the footer labels it `avg` rather than pretending it is decode speed.
+     */
+    private finishMessage(message: MessageEnd, now: number): void {
+        const usage = message.usage;
+        const fromMessage = reportedContext(usage);
+        if (fromMessage !== null) this.lastContext = fromMessage;
+        const lastLive = this.rate.value(now);
+        const final = computeFinalReading({
+            usage,
+            stopReason: message.stopReason,
+            hasToolCall: message.hasToolCall,
+            assistantStartAt: this.assistantStartAt,
+            firstDeltaAt: this.firstDeltaAt,
+            endAt: now,
+            thinkingCharacters: this.thinkingCharacters,
+            lastLive,
+        });
+        if (final !== null) this.lastFinal = final;
+        const modelKey = this.messageModelKey ?? this.status?.modelKey ?? null;
+        if (modelKey !== null) {
+            const current = this.calibrationByModel.get(modelKey) ?? 1;
+            this.calibrationByModel.set(
+                modelKey,
+                nextCalibration(current, usage.output, this.rawEstimate, final),
+            );
+            this.trimCalibrations();
+        }
+        this.pendingOutput = Math.max(
+            this.pendingOutput,
+            this.liveBaseline + (usage.output ?? this.rate.total),
+        );
+        this.streaming = false;
+        this.rate.clear();
+        this.assistantStartAt = null;
+        this.firstDeltaAt = null;
+        this.lastDeltaAt = null;
+        this.thinkingCharacters = 0;
+        this.rawEstimate = 0;
+        this.messageModelKey = null;
+        this.paint(true);
+        this.scheduleStatusRefresh(this.version);
+    }
+
+    private calibrationFor(modelKey: string | null): number {
+        return modelKey === null ? 1 : (this.calibrationByModel.get(modelKey) ?? 1);
+    }
+
+    private trimCalibrations(): void {
+        while (this.calibrationByModel.size > MAX_CALIBRATION_MODELS) {
+            const oldest = this.calibrationByModel.keys().next().value;
+            if (oldest === undefined) break;
+            this.calibrationByModel.delete(oldest);
         }
     }
 
@@ -273,14 +452,17 @@ class TokenlineFooter {
         if (!force && now - this.lastPaintAt < UPDATE_INTERVAL_MS) return;
         this.lastPaintAt = now;
         const liveOutput = this.streaming ? this.liveBaseline + this.rate.total : 0;
-        let tokensPerSecond = this.streaming ? this.rate.value(now) : null;
-        if (this.streaming && this.lastDeltaAt > 0 && now - this.lastDeltaAt > STALE_TPS_MS) {
-            tokensPerSecond = 0;
-        }
+        const live = this.streaming ? this.rate.value(now) : null;
+        const reading: RateReading | null =
+            live === null
+                ? this.lastFinal
+                : {
+                      kind: "live",
+                      value: live,
+                  };
         const line = formatFooter({
             status,
-            streaming: this.streaming,
-            rate: tokensPerSecond,
+            reading,
             liveOutput,
             pendingOutput: this.pendingOutput,
             lastContext: this.lastContext,
@@ -326,6 +508,7 @@ class TokenlineFooter {
         this.unsubscribe?.();
         clearInterval(this.tickTimer);
         this.clearConnection();
+        this.calibrationByModel.clear();
         this.restoreNative();
     }
 }

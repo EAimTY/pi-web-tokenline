@@ -5,11 +5,18 @@ This repository is the Tokenline PI WEB plugin: a browser-only footer that repla
 ## Architecture
 
 - **`src/` is the only source of truth; `dist/` is committed build output.** PI WEB serves everything inside `browserRoot` verbatim and never compiles installed plugin source, and `pi install git:…` clones the repository and runs `npm install --omit=dev`, which runs `prepare` without a dev toolchain. A source-only package would install broken, so the Vite library build in `dist/` is tracked and `npm run verify:dist` fails when it drifts from `src/`. Never edit `dist/` by hand.
-- `src/pi-web-plugin.ts` — the browser entry: selection subscriptions, the status fetch and event socket for the selected session, and the footer paint loop.
-- `src/metrics.ts` — pure model: token estimation, trailing-window TPS, context selection, count formatting, footer text, and CSS string quoting. No host access; unit-tested directly.
-- `src/host-contract.ts` — the private PI WEB session status and event payloads, narrowed at the boundary. These routes are not public API; the host's `docs/plugins.md` lists internal routes as unsupported selectors, so every claim about them lives in this file and nowhere else.
+- `src/pi-web-plugin.ts` — the browser entry: selection subscriptions, the status fetch and event socket for the selected session, and the footer paint loop. The host's socket bridge re-sends the session daemon's JSON text as binary frames, so the entry decodes `ArrayBuffer` payloads and still accepts text.
+- `src/metrics.ts` — pure model: token estimation and per-model calibration, the trailing-window live TPS with first-chunk baseline and burst credit, exact final-rate selection, context selection, count formatting, footer text, and CSS string quoting. No host access; unit-tested directly.
+- `src/host-contract.ts` — the private PI WEB session status and event payloads, narrowed at the boundary. These routes are not public API; the host's `docs/plugins.md` lists internal routes as unsupported selectors, so every claim about them lives in this file and nowhere else. Completion metadata (stop reason, tool-call presence, reasoning) and model identity are part of that boundary.
 - `src/plugin-api.ts` — a deliberately minimal mirror of the host's public browser contract (`@jmfederico/pi-web/plugin-api`, API v5). Depending on the host package for types would install its whole web application and its Pi peers for three definitions; keep the mirror aligned with the host version named in it.
 - `src/footer.css` — the stylesheet contribution that hides the native footer spans and renders the plugin line through `.bar::after`.
+
+## TPS semantics
+
+- The live value is an estimate, never provider-exact. The first delta only opens the window because its generation time was not observed; publish nothing before one second of history; cap each interval at a plausible multiple of the recent raw pace; read `0` after a genuine stall.
+- The final value is exact per assistant message. Use decode time (`first token → message end`) only when the message has no tool call, no unobserved reasoning, and a usable decode window. Otherwise use end-to-end time (`assistant message start → end`) and label it `avg`.
+- Never use provider `usage.output` with a text-only delta window when tool-call tokens may be missing: that overstates decode speed. Never train estimate calibration on tool-call, hidden-reasoning, or end-to-end fallback messages for the same reason.
+- PI WEB's browser event stream omits tool-call argument deltas and live provider usage. Do not infer tool-call tokens from `tool.start`, status token counters, or final usage outside the final-rate rules above.
 
 ## Global Working Rules
 
